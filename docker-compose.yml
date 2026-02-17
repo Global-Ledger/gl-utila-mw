@@ -1,0 +1,14 @@
+services:
+  utila-gl-mw:
+    image: node:20-alpine
+    container_name: utila-gl-mw
+    working_dir: /app
+    command: ["node", "/app/utila-gl-mw.obf.js"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
+    volumes:
+      - ./utila-gl-mw.obf.js:/app/utila-gl-mw.obf.js:ro
+      - ./utila_private.pem:/run/secrets/utila_private.pem:ro
