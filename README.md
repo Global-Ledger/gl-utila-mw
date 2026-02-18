@@ -1,184 +1,230 @@
 # Utila ↔ Global Ledger Approval Middleware
 
-This middleware integrates **Utila Transaction Approval** workflow with **Global Ledger (GL) risk scoring**.
+This middleware connects Utila transaction approvals with Global Ledger (GL) risk scoring.
 
-When Utila creates an outgoing transaction that reaches `AWAITING_APPROVAL`, the middleware:
-1) fetches full transaction details from Utila;
-2) extracts destination address (+ token contract when it is a token transfer);
-3) requests the GL risk score;
-4) votes **APPROVE** or **DENY** back to Utila based on the configured threshold.
+For each outgoing transaction that reaches `AWAITING_APPROVAL`, the middleware:
 
-The service is stateless and can run as a single container behind HTTPS with a public webhook endpoint.
+1. Fetches full transaction details from Utila.
+2. Extracts destination address (and token contract when relevant).
+3. Requests GL risk score.
+4. Sends `APPROVE` or `DENY` vote back to Utila based on `RISK_THRESHOLD`.
+
+The service is stateless and runs as a single container behind an HTTPS webhook endpoint.
 
 ---
 
-## 1) What you will receive from Global Ledger
+## 1) Package contents
 
-You will receive two files:
+You receive:
 
-- `utila-gl-mw.obf.js` — **obfuscated** middleware script (Node.js ESM).
+- `utila-gl-mw.obf.js` — obfuscated middleware script (Node.js ESM).
 - `.env.example` — configuration template.
+- `docker-compose.yml` — reference deployment manifest.
 
-> You do NOT need to modify the script. All customization is done via environment variables.
+All customization is done via environment variables.
 
 ---
 
 ## 2) Prerequisites
 
-### 2.1 Utila (required)
+### 2.1 Utila setup
 
-Configure the following in Utila Console:
-
-#### A) Create a Service Account
-- Utila Console → Settings → Service Accounts → Create
-- Save the **service account email** (example):  
-  `gl-...@vault-<vaultId>.utilaserviceaccount.io`
-
-#### B) Create an RSA private key (4096 bits)
-Generate locally:
+- Step 1: Create a Service Account in Utila Console (`Settings` → `Service Accounts`).
+- Step 2: Save the service account email (example: `gl-...@vault-<vaultId>.utilaserviceaccount.io`).
+- Step 3: Generate RSA key pair (4096 bits):
 
 ```bash
 openssl genpkey -algorithm RSA -out utila_private.pem -pkeyopt rsa_keygen_bits:4096
 openssl rsa -in utila_private.pem -pubout -out utila_public.pem
 ```
 
-Upload `utila_public.pem` (public key) into the Service Account settings in Utila.
+- Step 4: Upload `utila_public.pem` to the Service Account in Utila.
+- Step 5: Configure transaction policy to require Service Account approval (`Settings` → `Policies` → `Transaction Policies`).
+- Step 6: Configure webhook (`Settings` → `Webhooks`) with URL:
 
-Keep `utila_private.pem` secure — it is used to sign JWTs for Utila API.
-
-#### C) Configure Transaction Policy
-- Utila Console → Settings → Policies → Transaction Policies
-- Create a rule to require approval by your Service Account
-- This ensures transactions enter `AWAITING_APPROVAL` and webhook events are emitted.
-
-#### D) Configure Webhook
-- Utila Console → Settings → Webhooks → Add webhook
-- URL:
-
-```
+```text
 https://<your-public-domain>/webhook
 ```
 
-- Enable events:
-  - `TRANSACTION_STATE_UPDATED`
-  - (optional) `TRANSACTION_CREATED`
-  - (optional) `TEST`
+- Step 7: Enable webhook event `TRANSACTION_STATE_UPDATED` (optional: `TRANSACTION_CREATED`, `TEST`).
 
-### 2.2 Global Ledger (required)
+### 2.2 Global Ledger setup
 
-Obtain a valid **GL API key** from Global Ledger.
+Obtain a valid `GL_API_KEY` from Global Ledger.
 
 ---
 
 ## 3) Configuration
 
-Create `.env` from the provided `.env.example`.
+Create `.env` from `.env.example`.
 
-### 3.1 Environment variables
+### Environment variables
 
 | Variable | Required | Example | Description |
-|---|---:|---|---|
-| `UTILA_EMAIL` | ✅ | `gl-...@vault-...utilaserviceaccount.io` | Utila Service Account email |
-| `UTILA_PRIVATE_KEY_PATH` | ✅ | `/run/secrets/utila_private.pem` | Path to RSA private key |
-| `GL_API_KEY` | ✅ | `...` | Global Ledger API key |
-| `RISK_THRESHOLD` | ✅ | `60` | If `score >= threshold` → `DENY`, else `APPROVE` |
-| `PORT` | ✅ | `3000` | Web server port |
-| `JWT_SKEW_SEC` | optional | `120` | JWT iat skew (prevents “token used before issued”) |
-| `JWT_TTL_SEC` | optional | `3600` | JWT TTL (must be <= 3600) |
-| `MAX_TX_ATTEMPTS` | optional | `12` | Retry count while waiting for transfers in Utila tx |
-| `SCAN_PAGE_SIZE` | optional | `100` | Startup scan page size |
-| `VAULT_ID` | optional | `12a5...` | If set, scan only this vault |
-| `DEFAULT_DECISION_UNSUPPORTED` | optional | `APPROVE` | APPROVE or DENY if network mapping is unsupported |
+| --- | --- | --- | --- |
+| `UTILA_EMAIL` | Yes | `gl-...@vault-...utilaserviceaccount.io` | Utila Service Account email |
+| `UTILA_PRIVATE_KEY_PATH` | Yes | `/run/secrets/utila_private.pem` | Path to RSA private key |
+| `GL_API_KEY` | Yes | `...` | Global Ledger API key |
+| `RISK_THRESHOLD` | Yes | `60` | If `score >= threshold` -> `DENY`, else `APPROVE` |
+| `PORT` | Yes | `3000` | Web server port |
+| `JWT_SKEW_SEC` | No | `120` | JWT issue-time skew (helps with clock drift) |
+| `JWT_TTL_SEC` | No | `3600` | JWT TTL (must be `<= 3600`) |
+| `MAX_TX_ATTEMPTS` | No | `12` | Retries while waiting for transfers in Utila transaction |
+| `SCAN_PAGE_SIZE` | No | `100` | Startup scan page size |
+| `VAULT_ID` | No | `12a5...` | Limit startup scan to one vault |
+| `DEFAULT_DECISION_UNSUPPORTED` | No | `APPROVE` | Fallback decision for unmapped networks (`APPROVE` or `DENY`) |
 
-### 3.2 Important behavior notes
+Behavior:
 
-- On startup the service scans Utila for **pending transactions** in `AWAITING_APPROVAL` and processes them.
-- The service **only votes** on `AWAITING_APPROVAL` outgoing transactions.
-- The service does NOT sign transactions. It only votes APPROVE/DENY.
-
----
-
-## 4) Supported networks & scoring modes
-
-Global Ledger supports two scoring modes:
-- **Advanced** mode: `https://<chain>.glprotocol.com/...` (token is always `supported`)
-- **Essential** mode: `https://common.glprotocol.com/essential-api-<chain>/...` (token contract is included only if it exists)
-
-Network mapping is based on Utila `transaction.network` values.
-
-> If GL responds with HTTP 404 but returns `totalFunds` fields, the middleware treats it as a valid response and uses the score.
+- On startup, middleware scans pending `AWAITING_APPROVAL` transactions.
+- Middleware only votes on outgoing `AWAITING_APPROVAL` transactions.
+- Middleware does not sign transactions; it only sends approval votes.
 
 ---
 
-## 5) Run with Docker Compose (recommended)
+## 4) Network mapping (`transaction.network`)
 
-### 5.1 Files required on the server
+Middleware reads Utila `transaction.network` from transaction details and uses it to select the GL chain endpoint.
+
+Format:
+
+```text
+networks/{network_id}
+```
+
+Examples:
+
+- `networks/bitcoin-mainnet`
+- `networks/ethereum-mainnet`
+- `networks/ethereum-testnet-sepolia`
+
+If network mapping is missing, middleware applies `DEFAULT_DECISION_UNSUPPORTED`.
+
+Operational recommendation:
+
+- Validate real `transaction.network` values in your environment before go-live.
+- Use `DEFAULT_DECISION_UNSUPPORTED=DENY` for fail-closed posture.
+
+References:
+
+- `https://docs.utila.io/reference/transactions_gettransaction`
+- `https://docs.utila.io/reference/transactions_listtransactions`
+
+Note: if GL returns HTTP `404` with `totalFunds` fields, middleware treats it as a valid scoring response.
+
+---
+
+## 5) Deployment (Docker Compose)
 
 Place these files in one directory:
+
 - `docker-compose.yml`
 - `.env`
 - `utila-gl-mw.obf.js`
-- `utila_private.pem` (your RSA private key)
+- `utila_private.pem`
 
-### 5.2 Start
+Start:
 
 ```bash
 docker compose up -d
 docker compose logs -f
 ```
 
-The service listens on:
-- `http://localhost:<PORT>/webhook` (host port → container port)
+Webhook endpoint inside host:
 
-> You must expose it publicly via HTTPS using your reverse proxy / load balancer (recommended).
+- `http://localhost:<PORT>/webhook`
+
+Expose it publicly via HTTPS through reverse proxy or load balancer.
+
+If you use hardened security profile, replace disk-based key/API-key handling with runtime secrets:
+
+- inject `GL_API_KEY` from Vault/secret manager at runtime;
+- mount `utila_private.pem` from secrets backend (instead of storing it as a regular file on disk).
 
 ---
 
-## 6) Reverse proxy (HTTPS) requirements
-
-Utila webhook must call an HTTPS endpoint. Use one of:
-- Nginx / Caddy on the same host
-- Cloud load balancer / ingress
+## 6) Reverse proxy requirements
 
 Ensure:
-- `POST https://<domain>/webhook` forwards to `http://127.0.0.1:<PORT>/webhook`
-- Request body is not modified
-- Timeouts are reasonable (e.g. 30s)
+
+- `POST https://<domain>/webhook` forwards to `http://127.0.0.1:<PORT>/webhook`.
+- Request body is not modified.
+- Timeout is sufficient (for example, `30s`).
 
 ---
 
-## 7) Troubleshooting
+## 7) Security profiles
 
-### Auth test fails
-- Check `UTILA_EMAIL` matches the service account email in Utila.
-- Ensure the public key uploaded to Utila matches your `utila_private.pem`.
-- Ensure `JWT_TTL_SEC <= 3600`.
-- If you see `token used before issued`, increase `JWT_SKEW_SEC` (e.g. 120 → 300).
+The key pair in this guide is a service-account signing key pair for Utila JWT auth (not SSH).
 
-### No webhooks received
-- Verify webhook URL in Utila points to your public HTTPS endpoint.
-- Check reverse proxy routing to `/webhook`.
-- Verify enabled events include `TRANSACTION_STATE_UPDATED`.
+- `utila_private.pem` is secret.
+- `utila_public.pem` is not secret, but key integrity must be controlled.
 
-### Votes not applied
-- Confirm the transaction policy requires approval from the service account.
-- Ensure middleware logs show successful call to `:vote`.
+### 7.1 Profile A: baseline
+
+Suitable for small teams and non-critical environments:
+
+- Keep non-sensitive settings in `.env`.
+- `GL_API_KEY` may be stored in `.env` if policy allows.
+- Keep `utila_private.pem` on disk with strict permissions (`0400`/`0600`).
+- Never commit `.env` or key files to git.
+
+### 7.2 Profile B: hardened (recommended for production)
+
+Suitable for regulated or high-security environments:
+
+- Keep `.env` non-sensitive only.
+- Inject `GL_API_KEY` at runtime from Vault or equivalent secret manager.
+- Mount `utila_private.pem` as runtime secret (Docker/Kubernetes secret, tmpfs, Vault agent sidecar).
+- Restrict inbound traffic to known sources and enforce HTTPS.
+- Use least-privilege access and define key/API-key rotation schedule.
+- Prefer fail-closed default: `DEFAULT_DECISION_UNSUPPORTED=DENY`.
+
+Example (runtime injection for `GL_API_KEY`):
+
+```yaml
+services:
+  utila-gl-mw:
+    image: your-registry/utila-gl-mw:latest
+    env_file:
+      - .env
+    environment:
+      GL_API_KEY: ${GL_API_KEY}
+```
 
 ---
 
-## 8) Security notes (must read)
+## 8) Troubleshooting
 
-- Store `utila_private.pem` securely (Docker secret / filesystem permissions).
-- Do not commit `.env` into git.
-- Run behind HTTPS.
-- Restrict inbound access to only Utila IPs if possible.
-- Rotate GL API keys and Utila service keys per your internal policy.
+Auth issues:
+
+- Verify `UTILA_EMAIL` matches the Service Account email in Utila.
+- Verify uploaded public key matches your `utila_private.pem`.
+- Verify `JWT_TTL_SEC <= 3600`.
+- If you see `token used before issued`, increase `JWT_SKEW_SEC`.
+
+No webhooks:
+
+- Verify Utila webhook URL points to your public HTTPS endpoint.
+- Verify reverse proxy routes `/webhook` correctly.
+- Verify event `TRANSACTION_STATE_UPDATED` is enabled.
+
+Votes not applied:
+
+- Verify policy requires Service Account approval.
+- Verify middleware logs contain successful call to `:vote`.
+
+Unexpected decision on rare/new network:
+
+- Check `transaction.network` via Utila `GetTransaction`.
+- If mapping is missing, `DEFAULT_DECISION_UNSUPPORTED` is used.
 
 ---
 
 ## 9) Support
 
-If you need help, contact Global Ledger support and provide:
-- middleware logs around the failed transaction
-- Utila transaction id + vault id
-- timestamp and environment (prod/stage)
+When contacting Global Ledger support, provide:
+
+- Middleware logs around the failing transaction.
+- Utila transaction ID and vault ID.
+- Timestamp and environment (`prod`/`stage`).
